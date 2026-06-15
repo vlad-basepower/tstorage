@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -56,6 +55,14 @@ type Storage interface {
 	// If the timestamp is empty, it uses the machine's local timestamp in UTC.
 	// The precision of timestamps is nanoseconds by default. It can be changed using WithTimestampPrecision.
 	InsertRows(rows []Row) error
+	// Flush persists all compressed in-memory partitions to the underlying disk.
+	// Partitions get compressed in memory as they go out of the writable window;
+	// it's the caller's responsibility to call Flush to limit the heap usage.
+	// It does nothing for the in-memory mode.
+	Flush() error
+	// BufferedStats gives back the number of compressed in-memory partitions
+	// not yet persisted to disk, along with their total encoded byte size.
+	BufferedStats() (partitions int, bytes int64)
 	// Close gracefully shutdowns by flushing any unwritten data to the underlying disk partition.
 	Close() error
 }
@@ -187,6 +194,23 @@ func NewStorage(opts ...Option) (Storage, error) {
 		opt(s)
 	}
 
+	// periodically check and permanently remove expired partitions.
+	go func() {
+		ticker := time.NewTicker(checkExpiredInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-s.doneCh:
+				return
+			case <-ticker.C:
+				err := s.removeExpiredPartitions()
+				if err != nil {
+					s.logger.Printf("%v\n", err)
+				}
+			}
+		}
+	}()
+
 	if s.inMemoryMode() {
 		s.newPartition(nil, false)
 		return s, nil
@@ -248,22 +272,6 @@ func NewStorage(opts ...Option) (Storage, error) {
 	}
 	s.newPartition(nil, false)
 
-	// periodically check and permanently remove expired partitions.
-	go func() {
-		ticker := time.NewTicker(checkExpiredInterval)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-s.doneCh:
-				return
-			case <-ticker.C:
-				err := s.removeExpiredPartitions()
-				if err != nil {
-					s.logger.Printf("%v\n", err)
-				}
-			}
-		}
-	}()
 	return s, nil
 }
 
@@ -282,6 +290,9 @@ type storage struct {
 	workersLimitCh chan struct{}
 	// wg must be incremented to guarantee all writes are done gracefully.
 	wg sync.WaitGroup
+	// flushMu serializes the background compaction and the user-driven Flush,
+	// both of which mutate the partition list.
+	flushMu sync.Mutex
 
 	doneCh chan struct{}
 }
@@ -352,8 +363,8 @@ func (s *storage) ensureActiveHead() error {
 		return err
 	}
 	go func() {
-		if err := s.flushPartitions(); err != nil {
-			s.logger.Printf("failed to flush in-memory partitions: %v", err)
+		if err := s.compactPartitions(); err != nil {
+			s.logger.Printf("failed to compact in-memory partitions: %v", err)
 		}
 	}()
 	return nil
@@ -417,7 +428,10 @@ func (s *storage) Close() error {
 			return err
 		}
 	}
-	if err := s.flushPartitions(); err != nil {
+	if err := s.compactPartitions(); err != nil {
+		return fmt.Errorf("failed to close storage: %w", err)
+	}
+	if err := s.Flush(); err != nil {
 		return fmt.Errorf("failed to close storage: %w", err)
 	}
 	if err := s.removeExpiredPartitions(); err != nil {
@@ -441,9 +455,13 @@ func (s *storage) newPartition(p partition, punctuateWal bool) error {
 	return nil
 }
 
-// flushPartitions persists all in-memory partitions ready to persisted.
-// For the in-memory mode, just removes it from the partition list.
-func (s *storage) flushPartitions() error {
+// compactPartitions compresses all in-memory partitions that went out of
+// the writable window. Compressed partitions stay on the heap until Flush
+// persists them to disk.
+func (s *storage) compactPartitions() error {
+	s.flushMu.Lock()
+	defer s.flushMu.Unlock()
+
 	// Keep the first two partitions as is even if they are inactive,
 	// to accept out-of-order data points.
 	i := 0
@@ -462,27 +480,47 @@ func (s *storage) flushPartitions() error {
 			continue
 		}
 
-		if s.inMemoryMode() {
+		if memPart.size() == 0 {
 			if err := s.partitionList.remove(part); err != nil {
 				return fmt.Errorf("failed to remove partition: %w", err)
 			}
 			continue
 		}
 
-		// Start swapping in-memory partition for disk one.
-		// The disk partition will place at where in-memory one existed.
+		compressedPart := compressMemoryPartition(memPart, s.retention, s.logger)
+		if err := s.partitionList.swap(part, compressedPart); err != nil {
+			return fmt.Errorf("failed to swap partitions: %w", err)
+		}
+	}
+	return nil
+}
 
-		dir := filepath.Join(s.dataPath, fmt.Sprintf("p-%d-%d", memPart.minTimestamp(), memPart.maxTimestamp()))
-		if err := s.flush(dir, memPart); err != nil {
-			return fmt.Errorf("failed to compact memory partition into %s: %w", dir, err)
+// Flush persists all compressed in-memory partitions to disk, swapping them
+// for memory-mapped disk partitions.
+func (s *storage) Flush() error {
+	if s.inMemoryMode() {
+		return nil
+	}
+	s.flushMu.Lock()
+	defer s.flushMu.Unlock()
+
+	compressedParts := make([]*compressedPartition, 0)
+	iterator := s.partitionList.newIterator()
+	for iterator.next() {
+		if part, ok := iterator.value().(*compressedPartition); ok {
+			compressedParts = append(compressedParts, part)
+		}
+	}
+
+	// Persist from the oldest to the newest, because each persisted partition
+	// removes the oldest WAL segment.
+	for i := len(compressedParts) - 1; i >= 0; i-- {
+		part := compressedParts[i]
+		dir := filepath.Join(s.dataPath, fmt.Sprintf("p-%d-%d", part.minTimestamp(), part.maxTimestamp()))
+		if err := s.flush(dir, part); err != nil {
+			return fmt.Errorf("failed to flush compressed partition into %s: %w", dir, err)
 		}
 		newPart, err := openDiskPartition(dir, s.retention)
-		if errors.Is(err, ErrNoDataPoints) {
-			if err := s.partitionList.remove(part); err != nil {
-				return fmt.Errorf("failed to remove partition: %w", err)
-			}
-			continue
-		}
 		if err != nil {
 			return fmt.Errorf("failed to generate disk partition for %s: %w", dir, err)
 		}
@@ -497,8 +535,21 @@ func (s *storage) flushPartitions() error {
 	return nil
 }
 
-// flush compacts the data points in the given partition and flushes them to the given directory.
-func (s *storage) flush(dirPath string, m *memoryPartition) error {
+// BufferedStats gives back the number of compressed in-memory partitions
+// not yet persisted to disk, along with their total encoded byte size.
+func (s *storage) BufferedStats() (partitions int, bytes int64) {
+	iterator := s.partitionList.newIterator()
+	for iterator.next() {
+		if part, ok := iterator.value().(*compressedPartition); ok {
+			partitions++
+			bytes += int64(len(part.data))
+		}
+	}
+	return partitions, bytes
+}
+
+// flush writes out the compressed partition to the given directory.
+func (s *storage) flush(dirPath string, c *compressedPartition) error {
 	if dirPath == "" {
 		return fmt.Errorf("dir path is required")
 	}
@@ -507,54 +558,12 @@ func (s *storage) flush(dirPath string, m *memoryPartition) error {
 		return fmt.Errorf("failed to make directory %q: %w", dirPath, err)
 	}
 
-	f, err := os.Create(filepath.Join(dirPath, dataFileName))
-	if err != nil {
-		return fmt.Errorf("failed to create file %q: %w", dirPath, err)
+	dataPath := filepath.Join(dirPath, dataFileName)
+	if err := os.WriteFile(dataPath, c.data, fs.ModePerm); err != nil {
+		return fmt.Errorf("failed to write data to %s: %w", dataPath, err)
 	}
-	defer f.Close()
-	encoder := newSeriesEncoder(f)
 
-	metrics := map[string]diskMetric{}
-	m.metrics.Range(func(key, value interface{}) bool {
-		mt, ok := value.(*memoryMetric)
-		if !ok {
-			s.logger.Printf("unknown value found\n")
-			return false
-		}
-		offset, err := f.Seek(0, io.SeekCurrent)
-		if err != nil {
-			s.logger.Printf("failed to set file offset of metric %q: %v\n", mt.name, err)
-			return false
-		}
-
-		if err := mt.encodeAllPoints(encoder); err != nil {
-			s.logger.Printf("failed to encode a data point that metric is %q: %v\n", mt.name, err)
-			return false
-		}
-
-		if err := encoder.flush(); err != nil {
-			s.logger.Printf("failed to flush data points that metric is %q: %v\n", mt.name, err)
-			return false
-		}
-
-		totalNumPoints := mt.size + int64(len(mt.outOfOrderPoints))
-		metrics[mt.name] = diskMetric{
-			Name:          mt.name,
-			Offset:        offset,
-			MinTimestamp:  mt.minTimestamp,
-			MaxTimestamp:  mt.maxTimestamp,
-			NumDataPoints: totalNumPoints,
-		}
-		return true
-	})
-
-	b, err := json.Marshal(&meta{
-		MinTimestamp:  m.minTimestamp(),
-		MaxTimestamp:  m.maxTimestamp(),
-		NumDataPoints: m.size(),
-		Metrics:       metrics,
-		CreatedAt:     time.Now(),
-	})
+	b, err := json.Marshal(&c.meta)
 	if err != nil {
 		return fmt.Errorf("failed to encode metadata: %w", err)
 	}

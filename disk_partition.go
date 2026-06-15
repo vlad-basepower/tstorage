@@ -113,18 +113,28 @@ func (d *diskPartition) selectDataPoints(metric string, labels []Label, start, e
 	if d.expired() {
 		return nil, fmt.Errorf("this partition is expired: %w", ErrNoDataPoints)
 	}
+	points, err := selectDataPointsFromBlock(d.mappedFile, d.meta, metric, labels, start, end)
+	if err != nil {
+		return nil, fmt.Errorf("failed to select data points in %q: %w", d.dirPath, err)
+	}
+	return points, nil
+}
+
+// selectDataPointsFromBlock gives back certain metric's data points within the given range
+// out of a Gorilla-encoded block, either a memory-mapped data file or a heap-allocated one.
+func selectDataPointsFromBlock(block []byte, m meta, metric string, labels []Label, start, end int64) ([]*DataPoint, error) {
 	name := marshalMetricName(metric, labels)
-	mt, ok := d.meta.Metrics[name]
+	mt, ok := m.Metrics[name]
 	if !ok {
 		return nil, ErrNoDataPoints
 	}
-	r := bytes.NewReader(d.mappedFile)
+	r := bytes.NewReader(block)
 	if _, err := r.Seek(mt.Offset, io.SeekStart); err != nil {
 		return nil, fmt.Errorf("failed to seek: %w", err)
 	}
 	decoder, err := newSeriesDecoder(r)
 	if err != nil {
-		return nil, fmt.Errorf("failed to generate decoder for metric %q in %q: %w", name, d.dirPath, err)
+		return nil, fmt.Errorf("failed to generate decoder for metric %q: %w", name, err)
 	}
 
 	// TODO: Divide fixed-lengh chunks when flushing, and index it.
@@ -132,7 +142,7 @@ func (d *diskPartition) selectDataPoints(metric string, labels []Label, start, e
 	for i := 0; i < int(mt.NumDataPoints); i++ {
 		point := &DataPoint{}
 		if err := decoder.decodePoint(point); err != nil {
-			return nil, fmt.Errorf("failed to decode point of metric %q in %q: %w", name, d.dirPath, err)
+			return nil, fmt.Errorf("failed to decode point of metric %q: %w", name, err)
 		}
 		if point.Timestamp < start {
 			continue

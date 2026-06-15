@@ -208,6 +208,8 @@ func (p *partitionListImpl) String() string {
 		p := iterator.value()
 		if _, ok := p.(*memoryPartition); ok {
 			b.WriteString("[Memory Partition]")
+		} else if _, ok := p.(*compressedPartition); ok {
+			b.WriteString("[Compressed Partition]")
 		} else if _, ok := p.(*diskPartition); ok {
 			b.WriteString("[Disk Partition]")
 		} else {

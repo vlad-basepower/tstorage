@@ -62,7 +62,7 @@ func ExampleStorage_InsertRows() {
 }
 
 // simulates writing and reading in concurrent.
-func ExampleStorage_InsertRows_Select_concurrent() {
+func ExampleStorage_InsertRows_selectConcurrent() {
 	storage, err := tstorage.NewStorage(
 		tstorage.WithPartitionDuration(5*time.Hour),
 		tstorage.WithTimestampPrecision(tstorage.Seconds),
@@ -666,7 +666,7 @@ func ExampleStorage_InsertRows_expired() {
 	}
 
 	// Force three partitions with timestamps: (min: 1, max: 3), (min: 4, max: 6), (min: 7, max: 8).
-	// Inserting the third partition will force the first one to be flushed to disk and become unwritable.
+	// Inserting the third partition will force the first one to be compressed and become unwritable.
 	err = storage.InsertRows([]tstorage.Row{
 		{DataPoint: tstorage.DataPoint{Timestamp: 1600000001, Value: 0.1}, Metric: "metric1"},
 		{DataPoint: tstorage.DataPoint{Timestamp: 1600000003, Value: 0.1}, Metric: "metric1"},
